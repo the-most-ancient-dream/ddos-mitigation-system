@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from .feature_extractor import FEATURE_NAMES
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -38,97 +39,19 @@ ATTACK_LABELS = {
     'UDP': 17,
 }
 
-# Key features from CIC-DDoS-2019 that we'll use for classification
-# Selected for being computable from real-time traffic
-SELECTED_FEATURES = [
-    'Flow Duration',
-    'Total Fwd Packets',
-    'Total Backward Packets',
-    'Total Length of Fwd Packets',
-    'Total Length of Bwd Packets',
-    'Fwd Packet Length Max',
-    'Fwd Packet Length Min',
-    'Fwd Packet Length Mean',
-    'Fwd Packet Length Std',
-    'Bwd Packet Length Max',
-    'Bwd Packet Length Min',
-    'Bwd Packet Length Mean',
-    'Bwd Packet Length Std',
-    'Flow Bytes/s',
-    'Flow Packets/s',
-    'Flow IAT Mean',
-    'Flow IAT Std',
-    'Flow IAT Max',
-    'Flow IAT Min',
-    'Fwd IAT Total',
-    'Fwd IAT Mean',
-    'Fwd IAT Std',
-    'Fwd IAT Max',
-    'Fwd IAT Min',
-    'Bwd IAT Total',
-    'Bwd IAT Mean',
-    'Bwd IAT Std',
-    'Bwd IAT Max',
-    'Bwd IAT Min',
-    'Fwd PSH Flags',
-    'Bwd PSH Flags',
-    'Fwd URG Flags',
-    'Bwd URG Flags',
-    'Fwd Header Length',
-    'Bwd Header Length',
-    'Fwd Packets/s',
-    'Bwd Packets/s',
-    'Min Packet Length',
-    'Max Packet Length',
-    'Packet Length Mean',
-    'Packet Length Std',
-    'Packet Length Variance',
-    'FIN Flag Count',
-    'SYN Flag Count',
-    'RST Flag Count',
-    'PSH Flag Count',
-    'ACK Flag Count',
-    'URG Flag Count',
-    'CWE Flag Count',
-    'ECE Flag Count',
-    'Down/Up Ratio',
-    'Average Packet Size',
-    'Avg Fwd Segment Size',
-    'Avg Bwd Segment Size',
-    'Fwd Avg Bytes/Bulk',
-    'Fwd Avg Packets/Bulk',
-    'Fwd Avg Bulk Rate',
-    'Bwd Avg Bytes/Bulk',
-    'Bwd Avg Packets/Bulk',
-    'Bwd Avg Bulk Rate',
-    'Subflow Fwd Packets',
-    'Subflow Fwd Bytes',
-    'Subflow Bwd Packets',
-    'Subflow Bwd Bytes',
-    'Init_Win_bytes_forward',
-    'Init_Win_bytes_backward',
-    'act_data_pkt_fwd',
-    'min_seg_size_forward',
-    'Active Mean',
-    'Active Std',
-    'Active Max',
-    'Active Min',
-    'Idle Mean',
-    'Idle Std',
-    'Idle Max',
-    'Idle Min',
-]
+# Train with the same ordered features that the live extractor emits.
+SELECTED_FEATURES = FEATURE_NAMES.copy()
 
 
 class CICDataLoader:
-    """Load and preprocess CIC-DDoS-2019 dataset"""
+    """Load and preprocess CSV or Parquet CIC-DDoS-2019 files."""
     
     def __init__(self, data_dir: str = 'data/cic-ddos-2019'):
         """
         Initialize the data loader
         
         Args:
-            data_dir: Directory containing CIC-DDoS-2019 CSV files
+            data_dir: Directory containing CIC-DDoS-2019 CSV or Parquet files
         """
         self.data_dir = Path(data_dir)
         self.label_encoder = LabelEncoder()
@@ -137,12 +60,21 @@ class CICDataLoader:
         self._fitted = False
         
     def find_csv_files(self) -> List[Path]:
-        """Find all CSV files in the data directory"""
-        csv_files = list(self.data_dir.rglob('*.csv'))
+        """Find CSV files for compatibility with existing callers."""
+        csv_files = sorted(self.data_dir.rglob('*.csv'))
         logger.info(f"Found {len(csv_files)} CSV files in {self.data_dir}")
         return csv_files
+
+    def find_data_files(self) -> List[Path]:
+        """Find supported CSV and Parquet files in the data directory."""
+        files = sorted(
+            path for path in self.data_dir.rglob('*')
+            if path.is_file() and path.suffix.lower() in {'.csv', '.parquet'}
+        )
+        logger.info(f"Found {len(files)} CSV/Parquet files in {self.data_dir}")
+        return files
     
-    def load_single_csv(self, filepath: Path, sample_size: Optional[int] = None) -> pd.DataFrame:
+    def load_single_file(self, filepath: Path, sample_size: Optional[int] = None) -> pd.DataFrame:
         """
         Load a single CSV file with proper handling
         
@@ -154,8 +86,11 @@ class CICDataLoader:
             DataFrame with loaded data
         """
         try:
-            # Read CSV - CIC dataset has varying column names with spaces
-            df = pd.read_csv(filepath, low_memory=False, encoding='utf-8')
+            if filepath.suffix.lower() == '.parquet':
+                df = pd.read_parquet(filepath)
+            else:
+                # CIC CSV releases vary in whitespace and column naming.
+                df = pd.read_csv(filepath, low_memory=False, encoding='utf-8')
             
             # Strip whitespace from column names
             df.columns = df.columns.str.strip()
@@ -170,6 +105,36 @@ class CICDataLoader:
         except Exception as e:
             logger.error(f"Error loading {filepath}: {e}")
             return pd.DataFrame()
+
+    def load_single_csv(self, filepath: Path, sample_size: Optional[int] = None) -> pd.DataFrame:
+        """Backward-compatible CSV loader."""
+        return self.load_single_file(filepath, sample_size)
+
+    def _load_files(
+        self,
+        files: List[Path],
+        samples_per_file: Optional[int],
+        balance_classes: bool = False,
+    ) -> pd.DataFrame:
+        """Read a known group of files and optionally balance its labels."""
+        dfs = []
+        for filepath in files:
+            df = self.load_single_file(filepath, samples_per_file)
+            if not df.empty:
+                dfs.append(df)
+
+        if not dfs:
+            return pd.DataFrame()
+
+        combined_df = pd.concat(dfs, ignore_index=True)
+        logger.info(f"Combined dataset: {len(combined_df)} total samples")
+        label_col = next(
+            (column for column in combined_df.columns if str(column).strip() == 'Label'),
+            None,
+        )
+        if balance_classes and label_col is not None:
+            combined_df = self._balance_classes(combined_df)
+        return combined_df
     
     def load_dataset(self, 
                      max_files: Optional[int] = None,
@@ -186,33 +151,16 @@ class CICDataLoader:
         Returns:
             Combined DataFrame
         """
-        csv_files = self.find_csv_files()
+        data_files = self.find_data_files()
         
-        if not csv_files:
-            logger.warning(f"No CSV files found in {self.data_dir}")
+        if not data_files:
+            logger.warning(f"No CSV or Parquet files found in {self.data_dir}")
             return pd.DataFrame()
         
         if max_files:
-            csv_files = csv_files[:max_files]
+            data_files = data_files[:max_files]
         
-        dfs = []
-        for filepath in csv_files:
-            df = self.load_single_csv(filepath, samples_per_file)
-            if not df.empty:
-                dfs.append(df)
-        
-        if not dfs:
-            return pd.DataFrame()
-        
-        # Combine all dataframes
-        combined_df = pd.concat(dfs, ignore_index=True)
-        logger.info(f"Combined dataset: {len(combined_df)} total samples")
-        
-        # Balance classes if requested
-        if balance_classes and ' Label' in combined_df.columns:
-            combined_df = self._balance_classes(combined_df)
-        
-        return combined_df
+        return self._load_files(data_files, samples_per_file, balance_classes)
     
     def _balance_classes(self, df: pd.DataFrame, 
                          benign_ratio: float = 0.3) -> pd.DataFrame:
@@ -226,9 +174,14 @@ class CICDataLoader:
         Returns:
             Balanced DataFrame
         """
-        label_col = ' Label' if ' Label' in df.columns else 'Label'
-        
-        benign_mask = df[label_col].str.strip().str.upper() == 'BENIGN'
+        label_col = next(
+            (column for column in df.columns if str(column).strip() == 'Label'),
+            None,
+        )
+        if label_col is None:
+            return df
+
+        benign_mask = df[label_col].astype(str).str.strip().str.upper() == 'BENIGN'
         attack_df = df[~benign_mask]
         benign_df = df[benign_mask]
         
@@ -259,18 +212,53 @@ class CICDataLoader:
             return np.array([]), np.array([]), []
         
         # Get label column
-        label_col = ' Label' if ' Label' in df.columns else 'Label'
-        
-        # Extract labels
-        labels = df[label_col].str.strip().values
+        label_col = next(
+            (column for column in df.columns if str(column).strip() == 'Label'),
+            None,
+        )
+        if label_col is None:
+            logger.error("Dataset must contain a 'Label' column")
+            return np.array([]), np.array([]), []
+
+        labels = df[label_col].astype(str).str.strip().values
+        labels = np.asarray([
+            'BENIGN' if label.upper() == 'BENIGN' else label
+            for label in labels
+        ])
         
         # Find available features (column names may have spaces)
+        columns_by_name = {
+            str(column).strip().casefold(): column for column in df.columns
+        }
+        # CICFlowMeter v3 Parquet files renamed several columns while retaining
+        # the same measurements. Map those names to the live extractor schema.
+        aliases = {
+            'Total Length of Fwd Packets': ('Fwd Packets Length Total',),
+            'Total Length of Bwd Packets': ('Bwd Packets Length Total',),
+            'Min Packet Length': ('Packet Length Min',),
+            'Max Packet Length': ('Packet Length Max',),
+            'Average Packet Size': ('Avg Packet Size',),
+            'Init_Win_bytes_forward': ('Init Fwd Win Bytes', 'Init_Win_bytes_forward'),
+            'Init_Win_bytes_backward': ('Init Bwd Win Bytes', 'Init_Win_bytes_backward'),
+            'act_data_pkt_fwd': ('Fwd Act Data Packets', 'act_data_pkt_fwd'),
+            'min_seg_size_forward': ('Fwd Seg Size Min', 'min_seg_size_forward'),
+        }
+        selected_columns = []
         available_features = []
-        for feature in self.feature_names:
-            if feature in df.columns:
+        for feature in SELECTED_FEATURES:
+            source = columns_by_name.get(feature.casefold())
+            if source is None:
+                source = next(
+                    (
+                        columns_by_name[alias.casefold()]
+                        for alias in aliases.get(feature, ())
+                        if alias.casefold() in columns_by_name
+                    ),
+                    None,
+                )
+            if source is not None:
+                selected_columns.append(source)
                 available_features.append(feature)
-            elif f' {feature}' in df.columns:
-                available_features.append(f' {feature}')
         
         if not available_features:
             logger.error("No matching features found in dataset")
@@ -280,11 +268,9 @@ class CICDataLoader:
         logger.info(f"Using {len(available_features)} features")
         
         # Extract features
-        X = df[available_features].copy()
-        
-        # Clean feature names (remove leading spaces)
-        X.columns = X.columns.str.strip()
-        self.feature_names = list(X.columns)
+        X = df[selected_columns].copy()
+        X.columns = available_features
+        self.feature_names = available_features.copy()
         
         # Handle missing values - replace with 0
         X = X.fillna(0)
@@ -376,12 +362,83 @@ class CICDataLoader:
         Returns:
             Dictionary with train/val/test splits and metadata
         """
-        # Load dataset
-        df = self.load_dataset(
-            max_files=max_files,
-            samples_per_file=samples_per_file,
-            balance_classes=True
-        )
+        data_files = self.find_data_files()
+        if max_files:
+            data_files = data_files[:max_files]
+
+        # CIC-DDoS2019 Parquet mirrors often preserve the supplied train/test
+        # split in filenames. Keep that official holdout separate for binary
+        # training instead of mixing rows from the same captures.
+        train_files = [
+            path for path in data_files
+            if path.stem.lower().endswith(('-training', '_training'))
+        ]
+        test_files = [
+            path for path in data_files
+            if path.stem.lower().endswith(('-testing', '_testing'))
+        ]
+
+        if binary and train_files and test_files:
+            logger.info("Using dataset-provided training/testing file split")
+            train_df = self._load_files(
+                train_files, samples_per_file, balance_classes=True
+            )
+            test_df = self._load_files(
+                test_files, samples_per_file, balance_classes=False
+            )
+            if train_df.empty or test_df.empty:
+                logger.error("Could not load both training and testing files")
+                return {}
+
+            X_train_all, y_train_str, feature_names = self.preprocess(train_df)
+            X_test, y_test_str, test_feature_names = self.preprocess(test_df)
+            if len(X_train_all) == 0 or len(X_test) == 0:
+                logger.error("Preprocessing failed")
+                return {}
+            if feature_names != test_feature_names:
+                logger.error("Training and testing feature schemas differ")
+                return {}
+
+            y_train_all = self.encode_labels(y_train_str, binary=True)
+            y_test = self.encode_labels(y_test_str, binary=True)
+            validation_fraction = val_size / (1 - test_size)
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_train_all,
+                y_train_all,
+                test_size=validation_fraction,
+                random_state=42,
+                stratify=y_train_all,
+            )
+            if scale:
+                X_train, _ = self.scale_features(X_train, fit=True)
+                X_val, _ = self.scale_features(X_val, fit=False)
+                X_test, _ = self.scale_features(X_test, fit=False)
+
+            logger.info(f"Dataset shape: train={len(X_train_all)}, test={len(X_test)}")
+            logger.info(
+                f"Label distribution: train={np.bincount(y_train_all)}, "
+                f"test={np.bincount(y_test)}"
+            )
+            logger.info(
+                f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}"
+            )
+            return {
+                'X_train': X_train,
+                'X_val': X_val,
+                'X_test': X_test,
+                'y_train': y_train,
+                'y_val': y_val,
+                'y_test': y_test,
+                'feature_names': feature_names,
+                'scaler': self.scaler,
+                'label_encoder': None,
+                'binary_mode': True,
+                'original_labels': y_train_str,
+            }
+
+        # Fall back to a stratified random split for datasets without supplied
+        # train/test groups (and for multiclass label encoding).
+        df = self._load_files(data_files, samples_per_file, balance_classes=True)
         
         if df.empty:
             logger.error("Failed to load dataset")
@@ -523,9 +580,9 @@ if __name__ == '__main__':
     loader = CICDataLoader()
     
     # Try loading real dataset
-    csv_files = loader.find_csv_files()
+    data_files = loader.find_data_files()
     
-    if csv_files:
+    if data_files:
         print("Loading real CIC-DDoS-2019 dataset...")
         data = loader.prepare_data(max_files=2, samples_per_file=10000)
         if data:

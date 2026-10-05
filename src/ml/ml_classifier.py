@@ -113,8 +113,12 @@ class DDoSClassifier:
         self.is_trained = False
         self.feature_names: List[str] = []
         self.scaler = None
+        # Per-feature medians from the training split, used only for non-finite
+        # incoming feature values. Older saved models have no imputer metadata.
+        self.imputation_values: Optional[np.ndarray] = None
         self.metrics: Optional[ModelMetrics] = None
         self.training_date: Optional[str] = None
+        self.training_accuracy: Optional[float] = None
         
         # Attack type mapping for multi-class
         self.attack_types = [
@@ -152,6 +156,9 @@ class DDoSClassifier:
         
         # Train model
         self.model.fit(X_train, y_train)
+
+        self.training_accuracy = accuracy_score(y_train, self.model.predict(X_train))
+        logger.info(f"Training accuracy: {self.training_accuracy:.4f}")
         
         training_time = time.time() - start_time
         logger.info(f"Training completed in {training_time:.2f}s")
@@ -178,10 +185,11 @@ class DDoSClassifier:
             n_features=X_train.shape[1],
         )
         
-        logger.info(f"Accuracy: {self.metrics.accuracy:.4f}")
-        logger.info(f"Precision: {self.metrics.precision:.4f}")
-        logger.info(f"Recall: {self.metrics.recall:.4f}")
-        logger.info(f"F1 Score: {self.metrics.f1_score:.4f}")
+        evaluation_name = 'Validation' if X_val is not None and y_val is not None else 'Training'
+        logger.info(f"{evaluation_name} accuracy: {self.metrics.accuracy:.4f}")
+        logger.info(f"{evaluation_name} precision: {self.metrics.precision:.4f}")
+        logger.info(f"{evaluation_name} recall: {self.metrics.recall:.4f}")
+        logger.info(f"{evaluation_name} F1 score: {self.metrics.f1_score:.4f}")
         
         self.is_trained = True
         self.training_date = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -224,14 +232,21 @@ class DDoSClassifier:
         self.total_predictions += 1
         self.total_inference_time += inference_time
         
-        # Determine attack type
-        is_attack = prediction == 1
-        attack_prob = probabilities[1] if len(probabilities) > 1 else probabilities[0]
+        # Label 0 is BENIGN in both the binary and encoded multiclass pipelines.
+        classes = list(getattr(self.model, 'classes_', range(len(probabilities))))
+        is_attack = prediction != 0
+        attack_prob = sum(
+            probability
+            for label, probability in zip(classes, probabilities)
+            if label != 0
+        )
         confidence = max(probabilities) * 100
         
         # For binary classification, infer attack type from features
         if is_attack:
-            attack_type = self._infer_attack_type(X[0])
+            attack_type = self._infer_attack_type(
+                self._unscale_features(X[0]), self.feature_names
+            )
         else:
             attack_type = 'BENIGN'
         
@@ -265,20 +280,48 @@ class DDoSClassifier:
         
         results = []
         for i, (pred, probs) in enumerate(zip(predictions, probabilities)):
-            is_attack = pred == 1
-            attack_prob = probs[1] if len(probs) > 1 else probs[0]
+            classes = list(getattr(self.model, 'classes_', range(len(probs))))
+            is_attack = pred != 0
+            attack_prob = sum(
+                probability
+                for label, probability in zip(classes, probs)
+                if label != 0
+            )
             
             results.append(PredictionResult(
                 is_attack=is_attack,
                 attack_probability=float(attack_prob),
-                attack_type=self._infer_attack_type(X[i]) if is_attack else 'BENIGN',
+                attack_type=(
+                    self._infer_attack_type(
+                        self._unscale_features(X[i]), self.feature_names
+                    )
+                    if is_attack else 'BENIGN'
+                ),
                 confidence=float(max(probs) * 100),
                 inference_time_ms=inference_time,
             ))
         
         return results
     
-    def _infer_attack_type(self, features: np.ndarray) -> str:
+    def _unscale_features(self, features: np.ndarray) -> np.ndarray:
+        """Recover feature magnitudes for the heuristic attack-type label."""
+        if self.scaler is None:
+            return features
+
+        expected_count = getattr(self.scaler, 'n_features_in_', len(features))
+        if expected_count != len(features):
+            return features
+
+        try:
+            return self.scaler.inverse_transform(features.reshape(1, -1))[0]
+        except Exception:
+            return features
+
+    def _infer_attack_type(
+        self,
+        features: np.ndarray,
+        feature_names: Optional[List[str]] = None,
+    ) -> str:
         """
         Infer attack type from features (heuristic for binary classification)
         
@@ -288,16 +331,18 @@ class DDoSClassifier:
         Returns:
             Inferred attack type string
         """
-        # Use feature indices based on CIC feature order
-        # SYN Flag Count is at index 43
-        # ACK Flag Count is at index 46
-        # Flow Packets/s is at index 14
-        
         try:
-            syn_count = features[43] if len(features) > 43 else 0
-            ack_count = features[46] if len(features) > 46 else 0
-            packets_per_sec = features[14] if len(features) > 14 else 0
-            bytes_per_sec = features[13] if len(features) > 13 else 0
+            names = feature_names or self.feature_names
+            positions = {name: index for index, name in enumerate(names)}
+
+            def get_feature(name: str) -> float:
+                index = positions.get(name)
+                return float(features[index]) if index is not None else 0.0
+
+            syn_count = get_feature('SYN Flag Count')
+            ack_count = get_feature('ACK Flag Count')
+            packets_per_sec = get_feature('Flow Packets/s')
+            bytes_per_sec = get_feature('Flow Bytes/s')
             
             # Heuristic classification
             if syn_count > 100 and ack_count < 10:
@@ -359,8 +404,10 @@ class DDoSClassifier:
                 'model_type': self.model_type,
                 'feature_names': self.feature_names,
                 'scaler': self.scaler,
+                'imputation_values': self.imputation_values,
                 'metrics': self.metrics,
                 'training_date': self.training_date,
+                'training_accuracy': self.training_accuracy,
                 'n_estimators': self.n_estimators,
                 'max_depth': self.max_depth,
             }
@@ -395,16 +442,24 @@ class DDoSClassifier:
             self.model_type = save_dict.get('model_type', 'random_forest')
             self.feature_names = save_dict.get('feature_names', [])
             self.scaler = save_dict.get('scaler')
+            imputation_values = save_dict.get('imputation_values')
+            self.imputation_values = (
+                np.asarray(imputation_values, dtype=np.float64)
+                if imputation_values is not None else None
+            )
             self.metrics = save_dict.get('metrics')
             self.training_date = save_dict.get('training_date')
+            self.training_accuracy = save_dict.get('training_accuracy')
             self.n_estimators = save_dict.get('n_estimators', 100)
             self.max_depth = save_dict.get('max_depth', 15)
             self.is_trained = True
             
             logger.info(f"Model loaded from {filepath}")
             logger.info(f"Training date: {self.training_date}")
+            if self.training_accuracy is not None:
+                logger.info(f"Training accuracy: {self.training_accuracy:.4f}")
             if self.metrics:
-                logger.info(f"Accuracy: {self.metrics.accuracy:.4f}")
+                logger.info(f"Validation accuracy: {self.metrics.accuracy:.4f}")
             
             return True
             
@@ -426,95 +481,8 @@ class DDoSClassifier:
             'max_depth': self.max_depth,
             'n_features': len(self.feature_names),
             'training_date': self.training_date,
+            'training_accuracy': self.training_accuracy,
             'total_predictions': self.total_predictions,
             'avg_inference_ms': avg_inference,
             'metrics': self.metrics.to_dict() if self.metrics else None,
         }
-
-
-def train_ddos_classifier(data_dir: str = 'data/cic-ddos-2019',
-                          model_path: str = 'data/models/ddos_classifier.joblib',
-                          max_files: int = 5,
-                          samples_per_file: int = 50000) -> DDoSClassifier:
-    """
-    Train a DDoS classifier using CIC-DDoS-2019 dataset
-    
-    Args:
-        data_dir: Directory containing CIC CSV files
-        model_path: Path to save trained model
-        max_files: Maximum number of CSV files to load
-        samples_per_file: Maximum samples per file
-        
-    Returns:
-        Trained DDoSClassifier
-    """
-    from .data_loader import CICDataLoader
-    
-    logger.info("="*60)
-    logger.info("DDoS Classifier Training")
-    logger.info("="*60)
-    
-    # Load and prepare data
-    loader = CICDataLoader(data_dir)
-    data = loader.prepare_data(
-        max_files=max_files,
-        samples_per_file=samples_per_file,
-        binary=True,
-        scale=True,
-    )
-    
-    if not data:
-        logger.error("Failed to load training data")
-        return None
-    
-    # Create and train classifier
-    classifier = DDoSClassifier(
-        model_type='random_forest',
-        n_estimators=100,
-        max_depth=15,
-    )
-    
-    # Store scaler for inference
-    classifier.scaler = data['scaler']
-    
-    # Train
-    metrics = classifier.train(
-        X_train=data['X_train'],
-        y_train=data['y_train'],
-        X_val=data['X_val'],
-        y_val=data['y_val'],
-        feature_names=data['feature_names'],
-    )
-    
-    # Evaluate on test set
-    logger.info("\nTest Set Evaluation:")
-    y_pred = classifier.model.predict(data['X_test'])
-    test_accuracy = accuracy_score(data['y_test'], y_pred)
-    logger.info(f"Test Accuracy: {test_accuracy:.4f}")
-    logger.info(f"\nClassification Report:\n{classification_report(data['y_test'], y_pred)}")
-    
-    # Save model
-    classifier.save(model_path)
-    
-    # Print feature importance
-    logger.info("\nTop 10 Important Features:")
-    for name, importance in list(classifier.get_feature_importance(10).items()):
-        logger.info(f"  {name}: {importance:.4f}")
-    
-    return classifier
-
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    
-    # Try to train classifier
-    classifier = train_ddos_classifier(
-        max_files=2,
-        samples_per_file=10000,
-    )
-    
-    if classifier:
-        # Test prediction
-        test_features = np.random.randn(1, len(classifier.feature_names))
-        result = classifier.predict(test_features)
-        print(f"\nTest Prediction: {result}")

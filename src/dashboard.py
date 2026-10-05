@@ -5,6 +5,9 @@ Web Dashboard - Real-time monitoring dashboard
 from flask import Flask, render_template, jsonify, send_from_directory, request
 from flask_cors import CORS
 import json
+import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +18,9 @@ CORS(app)
 
 # Global reference to DDoS system (set by dashboard runner)
 ddos_system = None
+demo_process = None
+demo_last_exit_code = None
+demo_process_lock = threading.Lock()
 
 
 @app.route('/')
@@ -155,6 +161,40 @@ def index():
         .status-active {
             animation: pulse 2s infinite;
         }
+
+        .demo-controls {
+            margin: 0 auto 24px;
+            max-width: 780px;
+            padding: 18px 22px;
+            text-align: center;
+            background: rgba(255,255,255,0.15);
+            border: 1px solid rgba(255,255,255,0.18);
+            border-radius: 12px;
+        }
+
+        .demo-button {
+            padding: 11px 20px;
+            border: 0;
+            border-radius: 8px;
+            color: #19202b;
+            background: #ffd166;
+            font-size: 1em;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .demo-button:disabled {
+            cursor: wait;
+            opacity: 0.65;
+        }
+
+        .demo-note, .demo-status {
+            margin-top: 10px;
+            font-size: 0.9em;
+        }
+
+        .demo-note { opacity: 0.85; }
+        .demo-status { min-height: 1.2em; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -165,6 +205,14 @@ def index():
                 <span id="status">MONITORING</span>
             </div>
         </header>
+
+        <section class="demo-controls" aria-label="Traffic simulation">
+            <button id="start-demo-button" class="demo-button" onclick="startAttackDemo()">
+                Start simulated attack demo
+            </button>
+            <p class="demo-note">Uses simulated statistics, not real attack packets. The demo may add generated IPs to the blacklist.</p>
+            <p id="demo-status" class="demo-status" role="status" aria-live="polite">Checking demo status…</p>
+        </section>
         
         <div id="dashboard" class="dashboard">
             <div class="loading">Loading dashboard...</div>
@@ -186,6 +234,57 @@ def index():
                 updateDashboard(data);
             } catch (error) {
                 console.error('Error fetching data:', error);
+            }
+        }
+
+        async function refreshDemoStatus() {
+            const button = document.getElementById('start-demo-button');
+            const status = document.getElementById('demo-status');
+            try {
+                const response = await fetch('/api/demo/status', { cache: 'no-store' });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Could not read demo status');
+
+                button.disabled = Boolean(data.running);
+                button.textContent = data.running ? 'Simulation running…' : 'Start simulated attack demo';
+                if (data.running) {
+                    status.textContent = 'Demo is running. Watch Recent Alerts below.';
+                    status.style.color = '#ffd166';
+                } else if (data.last_exit_code === 0) {
+                    status.textContent = 'Demo finished. Check Recent Alerts and the blacklist.';
+                    status.style.color = '#2ed573';
+                } else if (data.last_exit_code !== null) {
+                    status.textContent = 'Demo ended with an error. Check the project terminal for details.';
+                    status.style.color = '#ffb3b3';
+                } else {
+                    status.textContent = 'Ready';
+                    status.style.color = '#fff';
+                }
+            } catch (error) {
+                status.textContent = 'Could not read demo status.';
+                status.style.color = '#ffb3b3';
+            }
+        }
+
+        async function startAttackDemo() {
+            const button = document.getElementById('start-demo-button');
+            const status = document.getElementById('demo-status');
+            const confirmed = window.confirm(
+                'Start the simulated traffic demo? It sends no real attack packets, but may add generated IPs to the blacklist.'
+            );
+            if (!confirmed) return;
+
+            button.disabled = true;
+            status.textContent = 'Starting simulation…';
+            try {
+                const response = await fetch('/api/demo/start', { method: 'POST' });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Could not start the demo');
+                await refreshDemoStatus();
+            } catch (error) {
+                button.disabled = false;
+                status.textContent = error.message;
+                status.style.color = '#ffb3b3';
             }
         }
         
@@ -332,7 +431,7 @@ def index():
                     ${data.ml_stats ? `
                         <div class="metric">
                             <span>Model Accuracy</span>
-                            <span class="metric-value">95.3%</span>
+                            <span class="metric-value">${data.ml_stats.model_accuracy == null ? 'N/A' : (data.ml_stats.model_accuracy * 100).toFixed(2) + '%'}</span>
                         </div>
                         <div class="metric">
                             <span>Total Predictions</span>
@@ -377,9 +476,11 @@ def index():
         
         // Initial fetch
         fetchData();
+        refreshDemoStatus();
         
         // Auto-refresh
         setInterval(fetchData, refreshInterval);
+        setInterval(refreshDemoStatus, 2000);
         
         // Countdown timer
         setInterval(() => {
@@ -391,6 +492,58 @@ def index():
 </body>
 </html>
     """
+
+
+@app.route('/api/demo/start', methods=['POST'])
+def api_start_demo():
+    """Start the existing statistics-only attack demo as a background process."""
+    global demo_process, demo_last_exit_code
+
+    if not ddos_system:
+        return jsonify({'error': 'System not initialized'}), 503
+
+    project_root = Path(__file__).resolve().parent.parent
+    demo_script = project_root / 'run_attack_demo.py'
+    if not demo_script.is_file():
+        return jsonify({'error': 'run_attack_demo.py was not found'}), 500
+
+    with demo_process_lock:
+        if demo_process is not None and demo_process.poll() is None:
+            return jsonify({'error': 'A simulation is already running'}), 409
+
+        if demo_process is not None:
+            demo_last_exit_code = demo_process.returncode
+
+        try:
+            demo_process = subprocess.Popen(
+                [sys.executable, str(demo_script), '--url', request.host_url.rstrip('/')],
+                cwd=str(project_root),
+                stdin=subprocess.DEVNULL,
+            )
+            demo_last_exit_code = None
+        except OSError as exc:
+            demo_process = None
+            return jsonify({'error': f'Could not start the demo: {exc}'}), 500
+
+    return jsonify({'running': True, 'message': 'Simulation started'}), 202
+
+
+@app.route('/api/demo/status')
+def api_demo_status():
+    """Report whether the demo process is active and its last exit code."""
+    global demo_process, demo_last_exit_code
+
+    with demo_process_lock:
+        if demo_process is None:
+            return jsonify({'running': False, 'last_exit_code': demo_last_exit_code})
+
+        exit_code = demo_process.poll()
+        if exit_code is None:
+            return jsonify({'running': True, 'last_exit_code': None})
+
+        demo_last_exit_code = exit_code
+        demo_process = None
+        return jsonify({'running': False, 'last_exit_code': demo_last_exit_code})
 
 
 @app.route('/api/simulate_attack', methods=['POST'])

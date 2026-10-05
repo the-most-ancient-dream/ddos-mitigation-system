@@ -374,20 +374,64 @@ class FeatureExtractor:
             flow_count=len(self.ip_flows)
         )
     
-    def extract_features_for_prediction(self, scaler=None) -> np.ndarray:
+    def extract_features_for_prediction(
+        self,
+        scaler=None,
+        feature_names: Optional[List[str]] = None,
+        imputation_values: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """
         Extract and scale features ready for ML prediction
         
         Args:
             scaler: Optional sklearn scaler (StandardScaler)
+            feature_names: Ordered feature names expected by the trained model.
+            imputation_values: Optional training-split medians, in model feature order.
             
         Returns:
             2D array of shape (1, n_features) for prediction
         """
         flow_features = self.extract_features()
-        features = flow_features.features.reshape(1, -1)
-        
+
+        if feature_names is None:
+            features = flow_features.features.reshape(1, -1)
+        else:
+            feature_positions = {
+                name: index for index, name in enumerate(flow_features.feature_names)
+            }
+            missing_features = [
+                name for name in feature_names if name not in feature_positions
+            ]
+            if missing_features:
+                raise ValueError(
+                    "The live feature extractor cannot provide model features: "
+                    + ", ".join(missing_features)
+                )
+
+            features = np.asarray(
+                [[flow_features.features[feature_positions[name]] for name in feature_names]],
+                dtype=np.float32,
+            )
+
+        if imputation_values is not None:
+            medians = np.asarray(imputation_values, dtype=np.float64).reshape(-1)
+            if medians.size != features.shape[1]:
+                raise ValueError(
+                    f"Imputation value count mismatch: model expects {medians.size}, "
+                    f"extractor produced {features.shape[1]}"
+                )
+            non_finite = ~np.isfinite(features)
+            if non_finite.any():
+                features = features.copy()
+                features[non_finite] = np.broadcast_to(medians, features.shape)[non_finite]
+
         if scaler is not None:
+            expected_count = getattr(scaler, 'n_features_in_', features.shape[1])
+            if expected_count != features.shape[1]:
+                raise ValueError(
+                    f"Feature count mismatch: model expects {expected_count}, "
+                    f"extractor produced {features.shape[1]}"
+                )
             features = scaler.transform(features)
         
         return features

@@ -1,24 +1,19 @@
-sudo -S rm -f data/blacklist.json
+# Run and test notes
 
-# Run the Application
-## 1. Setup Virtual Network (veth pair)
+Use the setup and launch instructions in [README.md](README.md).
+
+## Dashboard simulation
+
+Start the application with `--dashboard`, open the local dashboard, and press **Start simulated attack demo**. The demo posts generated statistics to the running detector; it does not send a network flood. It can add generated addresses to the blacklist.
+
+## Automated tests
+
+From the project root with the Python environment active:
+
 ```bash
-# Create veth0 <-> veth1 pair
-sudo ip link add veth0 type veth peer name veth1
-sudo ip link set veth0 up
-sudo ip link set veth1 up
-sudo ip addr add 192.168.99.1/24 dev veth0
-sudo ip addr add 192.168.99.2/24 dev veth1
+python -m pytest tests/ -v
 ```
 
-## 2. Start DDoS System (on veth1)
-```bash
-# Listen on veth1 (Ingress)
-echo "password" | sudo -S python3 main.py --interface veth1 --mode generic --dashboard
-```
+## Real packet simulation
 
-## 3. Launch Attack (from veth0)
-```bash
-# Send spoofed packets from veth0 targeting veth1
-sudo python3 attack_simulator.py --type mixed --distributed --source 100.100.100.100 --target 192.168.99.2 --duration 30 --interface veth0
-```
+`attack_simulator.py` sends packets. Only use it on an isolated lab interface and a target you own or are authorized to test. Do not run it against a public or production network.

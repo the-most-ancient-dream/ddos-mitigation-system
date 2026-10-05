@@ -1,112 +1,66 @@
-# 🛡️ Hybrid XDP & ML-Based DDoS Mitigation System
+# DDoS Detection and Mitigation
 
-This project is a high-performance **DDoS detection and mitigation system** that combines the speed of **eBPF/XDP** (Express Data Path) for kernel-level packet filtering with the intelligence of **Machine Learning (Random Forest)** for traffic classification.
+A local prototype that combines XDP/eBPF traffic monitoring, anomaly detection, an optional Random Forest classifier, and a Flask dashboard.
 
-By leveraging XDP, the system can block malicious traffic **before it even reaches the operating system's network stack**, achieving extremely high throughput and low latency.
+The included model is the balanced V2 binary classifier. The training CSV and generated evaluation graphs are not included.
 
----
+## Run in Ubuntu or WSL2
 
-## 💡 Why This Project Matters
+Clone the repository into this folder name:
 
-Traditional DDoS mitigation systems operate in user space, leading to higher latency and resource usage.  
-This project demonstrates how combining kernel-level filtering (XDP) with intelligent ML-based detection can create a highly efficient and scalable modern defense system.
+~~~bash
+git clone https://github.com/ucs200525/rapid-corona.git ddos-mitigation-system
+cd ddos-mitigation-system
+~~~
 
----
+Install the Linux eBPF tools and Python environment:
 
-## 🚀 Key Features
+~~~bash
+sudo apt update
+sudo apt install -y python3-full python3-bpfcc build-essential
+mkdir -p "$HOME/.venvs"
+python3 -m venv --system-site-packages "$HOME/.venvs/ddos-mitigation-system"
+source "$HOME/.venvs/ddos-mitigation-system/bin/activate"
+python -m pip install -r requirements.txt
+~~~
 
-* **Kernel-Level Blocking (XDP)**: Uses **eBPF (Extended Berkeley Packet Filter)** to hook into the network driver and drop malicious packets at the NIC level.
-* **Intelligent Anomaly Detection**:
-  - **Baseline Profiling**: Learns normal traffic patterns (PPS, protocol distribution).
-  - **ML Classification**: Uses a **Random Forest Classifier** to detect sophisticated attacks based on traffic features.
-* **Real-Time Dashboard**: Built using **Flask** and **Chart.js** for live monitoring.
-* **Distributed Attack Simulation**: Supports UDP, ICMP, TCP SYN, and HTTP floods with spoofed IP-based botnet simulation.
+Start monitoring on the WSL network interface:
 
----
+~~~bash
+sudo "$HOME/.venvs/ddos-mitigation-system/bin/python" main.py --interface eth0 --mode generic --dashboard
+~~~
 
-## 🧰 Tech Stack
+The app auto-loads data/models/ddos_classifier_balanced_v2.joblib. Open http://localhost:5000 in Windows. Stop it with Ctrl+C in the Ubuntu terminal.
 
-- **Kernel Programming:** eBPF, XDP (C)
-- **Backend:** Python, Flask
-- **Machine Learning:** Scikit-learn (Random Forest)
-- **Networking:** Linux Networking Stack, BPF Maps
-- **Visualization:** Chart.js
-- **Tools:** BCC, libbpf, Scapy
+The dashboard uses Flask's development server without sign-in. Keep it on a trusted local test machine. WSL sees its own virtual network interface, not every Windows network adapter.
 
----
+## Dashboard demo
 
-## 📊 Performance & Results
+The Start simulated attack demo button sends generated statistics to the app. It does not send a real network flood. It may add generated source IPs to the blacklist.
 
-- Achieves high-throughput packet processing using XDP at kernel level.
-- Successfully mitigates UDP, SYN, and ICMP flood attacks in real-time.
-- Reduces attack impact with low-latency filtering before packets reach user space.
-- Demonstrates effective attack detection using ML-based classification.
-- Maintains stable performance under simulated distributed attack scenarios.
+The separate attack_simulator.py sends network traffic. Use it only on a private lab interface and a target you own or are authorized to test.
 
----
+## Retrain with the balanced dataset
 
-## 📂 Project Structure & File Descriptions
+The balanced CSV is not included. From WSL, a Windows D: drive is usually available under /mnt/d/. Save a new candidate separately so the included model stays available:
 
-### Core Controller & UI
-- **`main.py`**: Entry point; loads XDP program, starts dashboard, and manages system flow.
-- **`src/dashboard.py`**: Flask-based dashboard for real-time visualization.
-- **`src/traffic_monitor.py`**: Interfaces between kernel (BPF maps) and user space.
+~~~bash
+python -m src.ml.balanced_dataset_trainer \
+  --dataset /mnt/d/capstone/datasets/balanced_dataset_v2.csv \
+  --model-path data/models/ddos_classifier_balanced_v2_candidate.joblib \
+  --results-dir reports/model_results_balanced_v2_candidate
+~~~
 
-### Mitigation & Detection Logic
-- **`src/anomaly_detector.py`**: Core decision engine comparing traffic with baseline.
-- **`src/alert_system.py`**: Handles logging and alerting.
-- **`src/metrics_collector.py`**: Collects traffic stats periodically.
+The trainer fits preprocessing on its training split and writes model evaluation graphs and metrics to the results directory. To run a newly trained candidate, pass its path with --ml-model.
 
-### Kernel Plane (eBPF/XDP)
-- **`src/ebpf/xdp_filter.c`**: Handles packet filtering (`XDP_DROP` / `XDP_PASS`).
-- **`src/ebpf/xdp_maps.h`**: Defines shared BPF maps.
+## Checks
 
-### Machine Learning (ML)
-- **`src/ml/feature_extractor.py`**: Converts traffic stats into ML features.
-- **`src/ml/ml_classifier.py`**: Random Forest prediction wrapper.
-- **`src/ml/model_trainer.py`**: Trains ML model using datasets (e.g., CIC-DDoS2019).
+Run the unit tests from the activated virtual environment:
 
-### Simulation & Testing
-- **`attack_simulator.py`**: Generates multiple DDoS attack types.
-- **`run_attack_demo.py`**: Automates multi-phase attack simulation.
+~~~bash
+python -m pytest tests/ -v
+~~~
 
----
+This prototype and its reported CSV metrics do not establish detection performance on live traffic. Review the limitations in the model evaluation output before relying on it.
 
-## 🏗️ System Architecture
-
-1. **Ingress Filter (Kernel)**: XDP intercepts packets.
-2. **Shared Memory (BPF Maps)**: Stats → User space, Blacklist → Kernel.
-3. **Analysis Engine (Python)**: Runs anomaly detection every second.
-4. **Mitigation Action**: Malicious IPs added to blacklist.
-5. **Visualization**: Dashboard updates in real-time.
-
----
-
-## 🧩 Challenges & Learnings
-
-- Efficient kernel ↔ user space communication using BPF maps.
-- Designing low-latency filtering without affecting legitimate traffic.
-- Feature engineering for ML-based anomaly detection.
-- Simulating realistic distributed attacks using spoofed IP traffic.
-
----
-
-## 🔮 Future Improvements
-
-- Integration of deep learning models for adaptive detection.
-- IPv6 traffic support.
-- Kubernetes-based scalable deployment.
-- Integration with SIEM tools for enterprise monitoring.
-
----
-
-## 🛠️ Installation & Usage
-
-### Prerequisites
-- Linux OS (Kernel 4.15+)
-- Python 3.8+
-- Root privileges
-
-### Quick Start
-
-1. Install dependencies:
+There is no LICENSE file yet. Choose a license before publishing if you want others to reuse the code.

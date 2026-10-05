@@ -1,6 +1,6 @@
 """
 Anomaly Detector - Statistical and ML-based anomaly detection for DDoS attacks
-Phase 2: Enhanced with ML classification using CIC-DDoS-2019 trained models
+ML-enhanced anomaly detection using the balanced V2 classifier
 """
 
 import logging
@@ -401,7 +401,9 @@ class MLEnhancedAnomalyDetector(AnomalyDetector):
         # Get ML prediction
         try:
             features = self.feature_extractor.extract_features_for_prediction(
-                scaler=self.classifier.scaler
+                scaler=self.classifier.scaler,
+                feature_names=self.classifier.feature_names or None,
+                imputation_values=self.classifier.imputation_values,
             )
             ml_result = self.classifier.predict(features)
             self.ml_predictions_count += 1
@@ -413,7 +415,7 @@ class MLEnhancedAnomalyDetector(AnomalyDetector):
             return self._combine_results(stat_result, ml_result)
             
         except Exception as e:
-            logger.debug(f"ML prediction failed: {e}")
+            logger.warning(f"ML prediction failed; using statistical detection: {e}")
             return stat_result
     
     def _combine_results(self, stat_result: AnomalyScore, 

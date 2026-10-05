@@ -1,6 +1,9 @@
 """
-Machine Learning module for DDoS attack classification
-Phase 2: ML-based classification using CIC-DDoS-2019 dataset
+Machine Learning module for DDoS attack classification.
+
+The included balanced V2 model uses the DDoSClassifier runtime wrapper.
+The CICDataLoader remains for compatibility and unit tests; the supported
+training command is src.ml.balanced_dataset_trainer.
 """
 
 from .ml_classifier import DDoSClassifier

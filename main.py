@@ -58,7 +58,7 @@ class DDoSMitigationSystem:
         
         # Auto-detect ML model if not provided
         if not ml_model_path:
-            default_model = Path('data/models/ddos_classifier.joblib')
+            default_model = Path('data/models/ddos_classifier_balanced_v2.joblib')
             if default_model.exists():
                 ml_model_path = str(default_model)
                 logger.info(f"Using auto-detected ML model: {ml_model_path}")
@@ -98,7 +98,7 @@ class DDoSMitigationSystem:
         logger.info(f"ML Enabled: {self.ml_enabled}")
         if self.ml_enabled and hasattr(self.anomaly_detector, 'classifier'):
             if self.anomaly_detector.classifier and self.anomaly_detector.classifier.metrics:
-                logger.info(f"ML Model Accuracy: {self.anomaly_detector.classifier.metrics.accuracy:.4f}")
+                logger.info(f"ML Model Validation Accuracy: {self.anomaly_detector.classifier.metrics.accuracy:.4f}")
         logger.info("=" * 70)
         
         # Check for eBPF support
@@ -170,12 +170,12 @@ class DDoSMitigationSystem:
                 self._prev_total_packets = stats.get('total_packets', 0)
                 self._prev_total_bytes = stats.get('total_bytes', 0)
                 
-                # Update baseline and profile
-                self.anomaly_detector.update_baseline(stats)
+                # Update the independent traffic profile before detection.
                 self.traffic_profiler.update_profile(stats, current_pps, current_bps)
                 
-                # Detect anomalies
+                # Detect against the previous sample before advancing detector state.
                 anomaly_result = self.anomaly_detector.detect_anomaly(stats, ip_stats)
+                self.anomaly_detector.update_baseline(stats)
                 
                 # Handle detected anomalies
                 if anomaly_result.is_anomaly:
@@ -333,19 +333,6 @@ Examples:
         help='Path to trained ML model (enables Phase 2 ML classification)'
     )
     
-    parser.add_argument(
-        '--train-model',
-        action='store_true',
-        help='Train a new ML model before starting'
-    )
-    
-    parser.add_argument(
-        '--data-path',
-        type=str,
-        default='data/cic-ddos-2019',
-        help='Path to CIC-DDoS-2019 dataset for training'
-    )
-    
     args = parser.parse_args()
     
     if args.debug:
@@ -360,28 +347,7 @@ Examples:
             logger.error("Try: sudo python main.py --interface eth0")
             sys.exit(1)
     
-    # Handle ML model training if requested
     ml_model_path = args.ml_model
-    if args.train_model:
-        logger.info("Training ML model...")
-        from src.ml.model_trainer import train_model
-        class TrainArgs:
-            data_path = args.data_path
-            model_path = 'data/models/ddos_classifier.joblib'
-            model_type = 'random_forest'
-            n_estimators = 100
-            max_depth = 15
-            max_files = 5
-            samples_per_file = 50000
-            multiclass = False
-            synthetic = True  # Use synthetic if real data unavailable
-        
-        classifier = train_model(TrainArgs())
-        if classifier:
-            ml_model_path = TrainArgs.model_path
-            logger.info(f"Model trained and saved to {ml_model_path}")
-        else:
-            logger.warning("Model training failed, continuing without ML")
     
     # Start system
     system = DDoSMitigationSystem(args.interface, args.mode, ml_model_path=ml_model_path)
